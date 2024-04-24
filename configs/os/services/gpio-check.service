@@ -1,0 +1,21 @@
+[Unit]
+Description=go gpio status check
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=3
+Environment="EXMQ_URL=tcp://10.160.240.74:1883"
+Environment="EXMQ_USERNAME=kvm"
+Environment="EXMQ_PASSWORD=Datrixinfo123"
+Environment="EXMQ_BUTTON_OPEN=1"
+Environment="TTYS_BAUD_VALUE=9600"
+Environment="IOT_BUFFER_SIZE=3"
+Environment="IOT_BUFFER_SECOND=2.0"
+Environment="IOT_BUFFER_FLICKER_KEY=0,0,0,0"
+ExecStart=/usr/local/bin/go-gpio-check
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=PiKVM - The KVMD persistent storage manager
+Before=kvmd.service
+
+[Service]
+User=root
+Group=root
+Type=simple
+Restart=always
+RestartSec=3
+
+ExecStart=/usr/local/bin/kvmd-pst --run
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,594 @@
+# ========================================================================== #
+#                                                                            #
+#    KVMD - The main PiKVM daemon.                                           #
+#                                                                            #
+#    Copyright (C) 2018-2022  Maxim Devaev <mdevaev@gmail.com>               #
+#                                                                            #
+#    This program is free software: you can redistribute it and/or modify    #
+#    it under the terms of the GNU General Public License as published by    #
+#    the Free Software Foundation, either version 3 of the License, or       #
+#    (at your option) any later version.                                     #
+#                                                                            #
+#    This program is distributed in the hope that it will be useful,         #
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of          #
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the           #
+#    GNU General Public License for more details.                            #
+#                                                                            #
+#    You should have received a copy of the GNU General Public License       #
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.  #
+#                                                                            #
+# ========================================================================== #
+
+
+import os
+import re
+import socket
+import asyncio
+import contextlib
+import dataclasses
+import inspect
+import urllib.parse
+import json
+import aiohttp_rpc
+
+from typing import Callable
+from typing import AsyncGenerator
+from typing import Any
+
+from aiohttp import web, ClientSession
+from aiohttp import ClientWebSocketResponse
+from aiohttp.web import BaseRequest
+from aiohttp.web import Request
+from aiohttp.web import Response
+from aiohttp.web import StreamResponse
+from aiohttp.web import WebSocketResponse
+from aiohttp.web import WSMsgType
+from aiohttp.web import Application
+from aiohttp.web import run_app
+from aiohttp.web import normalize_path_middleware
+
+try:
+    from aiohttp.web import AccessLogger  # type: ignore
+except ImportError:
+    from aiohttp.helpers import AccessLogger  # type: ignore
+
+from .logging import get_logger
+
+from .errors import OperationError
+from .errors import IsBusyError
+
+from .validators import ValidatorError
+
+from . import aiotools
+
+
+# =====
+class HttpError(Exception):
+    def __init__(self, msg: str, status: int) -> None:
+        super().__init__(msg)
+        self.status = status
+
+
+class UnauthorizedError(HttpError):
+    def __init__(self) -> None:
+        super().__init__("Unauthorized", 401)
+
+
+class ForbiddenError(HttpError):
+    def __init__(self) -> None:
+        super().__init__("Forbidden", 403)
+
+
+class UnavailableError(HttpError):
+    def __init__(self) -> None:
+        super().__init__("Service Unavailable", 503)
+
+
+class RequestMsgControl:
+    USERS_MODE = 0
+    WS_CLIENT = []
+
+
+# =====
+@dataclasses.dataclass(frozen=True)
+class HttpExposed:
+    method: str
+    path: str
+    auth_required: bool
+    handler: Callable
+
+
+_HTTP_EXPOSED = "_http_exposed"
+_HTTP_METHOD = "_http_method"
+_HTTP_PATH = "_http_path"
+_HTTP_AUTH_REQUIRED = "_http_auth_required"
+
+
+def exposed_http(http_method: str, path: str, auth_required: bool=True) -> Callable:
+    def set_attrs(handler: Callable) -> Callable:
+        setattr(handler, _HTTP_EXPOSED, True)
+        setattr(handler, _HTTP_METHOD, http_method)
+        setattr(handler, _HTTP_PATH, path)
+        setattr(handler, _HTTP_AUTH_REQUIRED, auth_required)
+        return handler
+    return set_attrs
+
+
+def _get_exposed_http(obj: object) -> list[HttpExposed]:
+    return [
+        HttpExposed(
+            method=getattr(handler, _HTTP_METHOD),
+            path=getattr(handler, _HTTP_PATH),
+            auth_required=getattr(handler, _HTTP_AUTH_REQUIRED),
+            handler=handler,
+        )
+        for handler in [getattr(obj, name) for name in dir(obj)]
+        if inspect.ismethod(handler) and getattr(handler, _HTTP_EXPOSED, False)
+    ]
+
+
+# =====
+@dataclasses.dataclass(frozen=True)
+class WsExposed:
+    event_type: str
+    handler: Callable
+
+
+_WS_EXPOSED = "_ws_exposed"
+_WS_EVENT_TYPE = "_ws_event_type"
+
+
+def exposed_ws(event_type: str) -> Callable:
+    def set_attrs(handler: Callable) -> Callable:
+        setattr(handler, _WS_EXPOSED, True)
+        setattr(handler, _WS_EVENT_TYPE, event_type)
+        return handler
+    return set_attrs
+
+
+def _get_exposed_ws(obj: object) -> list[WsExposed]:
+    return [
+        WsExposed(
+            event_type=getattr(handler, _WS_EVENT_TYPE),
+            handler=handler,
+        )
+        for handler in [getattr(obj, name) for name in dir(obj)]
+        if inspect.ismethod(handler) and getattr(handler, _WS_EXPOSED, False)
+    ]
+
+
+@dataclasses.dataclass(frozen=True)
+class RPCExposed:
+    event_type: str
+    handler: Callable
+
+
+_RPC_EXPOSED = "_rpc_exposed"
+_RPC_EVENT_TYPE = "_rpc_event_type"
+
+
+def exposed_rpc(event_type: str) -> Callable:
+    def set_attrs(handler: Callable) -> Callable:
+        setattr(handler, _RPC_EXPOSED, True)
+        setattr(handler, _RPC_EVENT_TYPE, event_type)
+        return handler
+    return set_attrs
+
+
+def _get_exposed_rpc(obj: object) -> list[RPCExposed]:
+    return [
+        RPCExposed(
+            event_type=getattr(handler, _RPC_EVENT_TYPE),
+            handler=handler
+        ) for handler in [getattr(obj, name) for name in dir(obj)]
+        if inspect.ismethod(handler) and getattr(handler, _RPC_EXPOSED, False)
+    ]
+
+
+# =====
+def make_json_response(
+    result: (dict | None)=None,
+    status: int=200,
+    set_cookies: (dict[str, str] | None)=None,
+    wrap_result: bool=True,
+) -> Response:
+
+    headers = dict()
+    if set_cookies:
+        auth_token = set_cookies.get("auth_token")
+        headers.__setitem__("auth_token", auth_token)
+    response = Response(
+        text=json.dumps(({
+            "ok": (status == 200),
+            "result": (result or {}),
+        } if wrap_result else result), sort_keys=True, indent=4),
+        status=status,
+        content_type="application/json",
+        headers=headers,
+    )
+    #if set_cookies:
+    #    for (key, value) in set_cookies.items():
+    #        response.set_cookie(key, value)
+    return response
+
+
+def make_json_exception(err: Exception, status: (int | None)=None) -> Response:
+    name = type(err).__name__
+    msg = str(err)
+    if isinstance(err, HttpError):
+        status = err.status
+    else:
+        get_logger().error("API error: %s: %s", name, msg)
+    assert status is not None, err
+    return make_json_response({
+        "error": name,
+        "error_msg": msg,
+    }, status=status)
+
+
+async def start_streaming(
+    request: Request,
+    content_type: str,
+    content_length: int=-1,
+    file_name: str="",
+) -> StreamResponse:
+
+    response = StreamResponse(status=200, reason="OK")
+    response.content_type = content_type
+    if content_length >= 0:
+        response.content_length = content_length
+    if file_name:
+        file_name = urllib.parse.quote(file_name, safe="")
+        response.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{file_name}"
+    await response.prepare(request)
+    return response
+
+
+async def stream_json(response: StreamResponse, result: dict, ok: bool=True) -> None:
+    await response.write(json.dumps({
+        "ok": ok,
+        "result": result,
+    }).encode("utf-8") + b"\r\n")
+
+
+async def stream_json_exception(response: StreamResponse, err: Exception) -> None:
+    name = type(err).__name__
+    msg = str(err)
+    get_logger().error("API error: %s: %s", name, msg)
+    await stream_json(response, {
+        "error": name,
+        "error_msg": msg,
+    }, False)
+
+
+async def send_ws_event(
+    wsr: (ClientWebSocketResponse | WebSocketResponse),
+    event_type: str,
+    event: (dict | None),
+) -> None:
+
+    await wsr.send_str(json.dumps({
+        "event_type": event_type,
+        "event": event,
+    }))
+
+
+def parse_ws_event(msg: str) -> tuple[str, dict]:
+    data = json.loads(msg)
+    if not isinstance(data, dict):
+        raise RuntimeError("Top-level event structure is not a dict")
+    event_type = data.get("event_type")
+    if not isinstance(event_type, str):
+        raise RuntimeError("event_type must be a string")
+    event = data["event"]
+    if not isinstance(event, dict):
+        raise RuntimeError("event must be a dict")
+    return (event_type, event)
+
+
+def parse_file(filepath: str, key) -> (str, str):
+    # 读取 JavaScript 文件
+    with open(filepath, 'r', encoding="utf8") as file:
+        content = file.read()
+        file.close()
+
+    # 提取 value 值
+    pattern = r'{key}:\s*"(.*?)"'.format(key=key)
+    match = re.search(pattern, content)
+    if match:
+        value = match.group(1)
+        return value, content
+    else:
+        return None
+
+
+def get_value(filepath: str, key) -> (str, str):
+    return parse_file(filepath=filepath, key=key)
+
+
+def set_value(filepath: str, key: str, new_value: str):
+    # 拿到当前值
+    old_value, content = parse_file(filepath=filepath, key=key)
+
+    if old_value:
+        with open(filepath, 'w', encoding="utf8") as file:
+            # 对当前值进行替换并写入
+            new_content = content.replace(old_value, new_value)
+            file.write(new_content)
+            file.close()
+
+
+async def start_operate(filepath: str, key: str, equipment_id: int, operator_id: int):
+    """
+    开始远程操作
+    """
+    try:
+        rcc_addr = get_value(filepath=filepath, key=key)
+        if rcc_addr:
+            async with ClientSession() as session:
+                async with session.post(
+                    f"{rcc_addr[0]}/api/equipment/operate_logs",
+                    json=
+                    dict(
+                        equipment_id=equipment_id,
+                        operator_id=operator_id,
+                    )
+                ) as response:
+                    data = await response.json()
+                    if response.status != 200:
+                        get_logger(2).error("create operate_id error: ", data["msg"])
+                    await session.close()
+                    return data["data"]["id"]
+    except Exception as e:
+        get_logger(2).error(e)
+
+
+async def end_operate(filepath: str, key: str, operate_id: int):
+    """
+    结束远程操作
+    """
+    try:
+        rcc_addr = get_value(filepath=filepath, key=key)
+        if rcc_addr:
+            async with ClientSession() as session:
+                async with session.put(
+                    f"{rcc_addr[0]}/api/equipment/operate_logs",
+                    json=
+                    dict(
+                        operate_log_id=operate_id,
+                    )
+                ) as response:
+                    data = await response.json()
+                    if response.status != 200:
+                        get_logger(2).error("put operate_id error: ", data["msg"])
+                    await session.close()
+    except Exception as e:
+        get_logger(2).error(e)
+
+
+# =====
+_REQUEST_AUTH_INFO = "_kvmd_auth_info"
+
+
+def _format_P(request: BaseRequest, *_, **__) -> str:  # type: ignore  # pylint: disable=invalid-name
+    return (getattr(request, _REQUEST_AUTH_INFO, None) or "-")
+
+
+AccessLogger._format_P = staticmethod(_format_P)  # type: ignore  # pylint: disable=protected-access
+
+
+def set_request_auth_info(request: BaseRequest, info: str) -> None:
+    setattr(request, _REQUEST_AUTH_INFO, info)
+
+
+# =====
+@dataclasses.dataclass(frozen=True)
+class WsSession:
+    wsr: WebSocketResponse
+    kwargs: dict[str, Any]
+
+    def __str__(self) -> str:
+        return f"WsSession(id={id(self)}, {self.kwargs})"
+
+    async def send_event(self, event_type: str, event: (dict | None)) -> None:
+        await send_ws_event(self.wsr, event_type, event)
+
+
+class HttpServer:
+    def __init__(self) -> None:
+        self.__ws_heartbeat: (float | None) = None
+        self.__ws_handlers: dict[str, Callable] = {}
+        self.__ws_sessions: list[WsSession] = []
+        self.__ws_sessions_lock = asyncio.Lock()
+        self.__rpc_server = aiohttp_rpc.rpc_server
+        self.__settings_file = "/usr/share/kvmd/web/share/js/setting.js"
+        self.__key = "rcc_base_url"
+
+    def run(
+        self,
+        unix_path: str,
+        unix_rm: bool,
+        unix_mode: int,
+        heartbeat: float,
+        access_log_format: str,
+    ) -> None:
+
+        self.__ws_heartbeat = heartbeat
+
+        if unix_rm and os.path.exists(unix_path):
+            os.remove(unix_path)
+        server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server_socket.bind(unix_path)
+        if unix_mode:
+            os.chmod(unix_path, unix_mode)
+
+        run_app(
+            sock=server_socket,
+            app=self.__make_app(),
+            shutdown_timeout=1,
+            access_log_format=access_log_format,
+            print=self.__run_app_print,
+            loop=asyncio.get_event_loop(),
+        )
+
+    # =====
+
+    def _add_exposed(self, *objs: object) -> None:
+        for obj in objs:
+            for http_exposed in _get_exposed_http(obj):
+                self.__add_exposed_http(http_exposed)
+            for ws_exposed in _get_exposed_ws(obj):
+                self.__add_exposed_ws(ws_exposed)
+            for rpc_exposed in _get_exposed_rpc(obj):
+                self.__add_exposed_rpc(rpc_exposed)
+
+    def __add_exposed_http(self, exposed: HttpExposed) -> None:
+        async def wrapper(request: Request) -> Response:
+            try:
+                await self._check_request_auth(exposed, request)
+                return (await exposed.handler(request))
+            except IsBusyError as err:
+                return make_json_exception(err, 409)
+            except (ValidatorError, OperationError) as err:
+                return make_json_exception(err, 400)
+            except HttpError as err:
+                return make_json_exception(err)
+        self.__app.router.add_route(exposed.method, exposed.path, wrapper)
+
+    def __add_exposed_ws(self, exposed: WsExposed) -> None:
+        self.__ws_handlers[exposed.event_type] = exposed.handler
+
+    def __add_exposed_rpc(self, exposed: RPCExposed) -> None:
+        self.__rpc_server.add_method(exposed.handler)
+
+    # =====
+
+    @contextlib.asynccontextmanager
+    async def _ws_session(self, request: Request, **kwargs: Any) -> AsyncGenerator[WsSession, None]:
+        assert self.__ws_heartbeat is not None
+        wsr = WebSocketResponse(heartbeat=self.__ws_heartbeat)
+        await wsr.prepare(request)
+        ws = WsSession(wsr, kwargs)
+
+        async with self.__ws_sessions_lock:
+            self.__ws_sessions.append(ws)
+            RequestMsgControl.WS_CLIENT.append(ws)
+            get_logger(2).info("Registered new client session: %s; clients now: %d", ws, len(self.__ws_sessions))
+
+        try:
+            await self._on_ws_opened()
+            yield ws
+        finally:
+            await aiotools.shield_fg(self.__close_ws(ws))
+
+    async def _ws_loop(self, ws: WsSession) -> WebSocketResponse:
+        logger = get_logger()
+        async for msg in ws.wsr:
+            if msg.type != WSMsgType.TEXT:
+                break
+            try:
+                (event_type, event) = parse_ws_event(msg.data)
+            except Exception as err:
+                logger.error("Can't parse JSON event from websocket: %r", err)
+            else:
+                handler = self.__ws_handlers.get(event_type)
+                if handler:
+                    await handler(ws, event)
+                else:
+                    logger.error("Unknown websocket event: %r", msg.data)
+        return ws.wsr
+
+    async def _broadcast_ws_event(self, event_type: str, event: (dict | None)) -> None:
+        if self.__ws_sessions:
+            await asyncio.gather(*[
+                ws.send_event(event_type, event)
+                for ws in self.__ws_sessions
+                if (
+                    not ws.wsr.closed
+                    and ws.wsr._req is not None  # pylint: disable=protected-access
+                    and ws.wsr._req.transport is not None  # pylint: disable=protected-access
+                )
+            ], return_exceptions=True)
+
+    async def _broadcast_rcc_ws_event(self, event_type: str, event: (dict | None)) -> None:
+        if self.__ws_sessions:
+            await asyncio.gather(*[
+                ws.send_event(event_type, event)
+                for ws in self.__ws_sessions
+                if (
+                    not ws.wsr.closed
+                    and ws.wsr._req is not None  # pylint: disable=protected-access
+                    and ws.wsr._req.transport is not None  # pylint: disable=protected-access
+                    and ws.kwargs.get("operate_id")
+                )
+            ], return_exceptions=True)
+
+    async def _close_all_wss(self) -> bool:
+        wss = self._get_wss()
+        for ws in wss:
+            await self.__close_ws(ws)
+        return bool(wss)
+
+    def _get_wss(self) -> list[WsSession]:
+        return list(self.__ws_sessions)
+
+    async def __close_ws(self, ws: WsSession) -> None:
+        async with self.__ws_sessions_lock:
+            try:
+                operate_id = ws.kwargs.get("operate_id", None)
+                if operate_id:
+                    await end_operate(filepath=self.__settings_file, key=self.__key, operate_id=operate_id)
+                self.__ws_sessions.remove(ws)
+                RequestMsgControl.WS_CLIENT.remove(ws)
+                get_logger(3).info("Removed client socket: %s; clients now: %d", ws, len(self.__ws_sessions))
+                await ws.wsr.close()
+            except Exception:
+                pass
+        await self._on_ws_closed()
+
+    # =====
+
+    async def _check_request_auth(self, exposed: HttpExposed, request: Request) -> None:
+        pass
+
+    async def _init_app(self) -> None:
+        raise NotImplementedError
+
+    async def _on_shutdown(self) -> None:
+        pass
+
+    async def _on_cleanup(self) -> None:
+        pass
+
+    async def _on_ws_opened(self) -> None:
+        pass
+
+    async def _on_ws_closed(self) -> None:
+        pass
+
+    # =====
+
+    async def __make_app(self) -> Application:
+        self.__app = Application(middlewares=[normalize_path_middleware(  # pylint: disable=attribute-defined-outside-init
+            append_slash=False,
+            remove_slash=True,
+            merge_slashes=True,
+        )])
+
+        async def on_shutdown(_: Application) -> None:
+            await self._on_shutdown()
+        self.__app.on_shutdown.append(on_shutdown)
+
+        async def on_cleanup(_: Application) -> None:
+            await self._on_cleanup()
+        self.__app.on_cleanup.append(on_cleanup)
+        self.__app.add_routes(
+            [web.post("/rpc", self.__rpc_server.handle_http_request)])
+
+        await self._init_app()
+        return self.__app
+
+    def __run_app_print(self, text: str) -> None:
+        logger = get_logger(0)
+        for line in text.strip().splitlines():
+            logger.info(line.strip())

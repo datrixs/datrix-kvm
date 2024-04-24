@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Author: wu.changwen
+# 主要安装基础环境
+
+pack_path="/home/tmp/pack/"
+LOG_FILE="/var/log/upgrade.lg"
+app2_pack="/home/tmp/pack/app2"
+
+source /usr/sbin/logger.sh ${LOG_FILE}
+
+if [ ! -e ${pack_path} ]; then
+    return 1
+fi
+
+echo "Start to install apps2"
+
+tar -zxvf ${app2_pack} -C /
+if [ $? -ne 0 ]; then
+    log_error "Install apps2 fail"
+else
+    echo "Complete install apps2"
+fi

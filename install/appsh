@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# Author: wu.changwen
+# 该脚本主要安装ustreamer、kvmd-backend、kvmd-front服务的脚本
+
+PACK_PATH="/home/tmp/pack"
+APP_PACK="/home/tmp/pack/apps"
+LOG_FILE="/var/log/upgrade.log"
+JANUS_PATH="/usr/lib/ustreamer/janus/"
+WEB_INSTALL_PATH="/usr/share/kvmd"
+APPS_PATH="/app/"
+
+NGINX_INIT_PATH="/app/nginx"
+
+source /usr/sbin/logger.sh ${LOG_FILE}
+
+# shellcheck disable=SC2164
+cd ${PACK_PATH}
+if [ ! -e ${APP_PACK} ]; then
+    log_warning "app pack not exist, not need to upgrade it"
+    exit 1
+fi 
+
+tar -zxvf ${APP_PACK} -C ./ >> "$LOG_FILE" 2>&1
+# shellcheck disable=SC2181
+if [ $? -ne 0 ]; then
+    log_error "tar zxvf ${APP_PACK} fail"
+    exit 1
+fi
+
+if [ ! -e ${APPS_PATH} ]; then
+    mkdir -p ${APPS_PATH}
+fi
+
+# INSTALL Ustreamer
+ustreamer_pack=${PACK_PATH}/pikvmd-ustreamer.tar.gz
+if [ ! -e ${ustreamer_pack} ]; then
+    log_warning "pikvmd-ustreamer.tar.gz not exist, not to upgrade it"
+else
+    # shellcheck disable=SC2164
+    tar -zxvf pikvmd-ustreamer.tar.gz && cd pikvm-ustreamer >> "$LOG_FILE" 2>&1
+    make -j8 >> "$LOG_FILE" 2>&1
+    make install >> "$LOG_FILE" 2>&1
+    # shellcheck disable=SC2181
+    if [ $? -ne 0 ]; then
+        log_error "Install pikvmd-ustreamer.tar.gz fail"
+        cd ../ && rm -rf pikvmd-ustreamer*
+        exit 1
+    fi
+
+    if [ -e ${JANUS_PATH} ]; then
+        mkdir -p ${JANUS_PATH}
+    fi
+
+    make janus -j8 >> "$LOG_FILE" 2>&1
+    # shellcheck disable=SC2181
+    if [ $? -ne 0 ]; then
+        log_error "Install ustreamer janus plugins fail"
+        cd ../ && rm -rf pikvmd-ustreamer*
+        exit 1
+    fi
+    cp libjanus_ustreamer.so /usr/lib/ustreamer/janus/
+    cd ../ && rm -rf pikvmd-ustreamer*
+    log_info "Install Ustreamer success"
+fi
+
+# Install KVMD web
+web_pack=${PACK_PATH}/pikvmd-front.tar.gz
+if [ ! -e ${web_pack} ]; then
+    log_warning "Pikvmd-front.tar.gz not exist, not to upgrade it"
+else
+    tar -zxvf pikvmd-front.tar.gz && mv pikvm-front web >> "$LOG_FILE" 2>&1
+    cp -rf web ${WEB_INSTALL_PATH}
+    rm -rf pikvmd-front.tar.gz && rm -rf web
+    log_info "Install KVMD web success"
+fi
+
+# Install KVMD Service
+kvmd_pack=${PACK_PATH}/pikvmd-backend.tar.gz
+if [ ! -e ${kvmd_pack} ]; then
+    log_warning "pikvmd-backend.tar.gz not exist, not to upgrade it"
+else
+    # shellcheck disable=SC2164
+    tar -zxvf pikvmd-backend.tar.gz && cd pikvm-backend >> "$LOG_FILE" 2>&1
+    python3 setup.py install >> "$LOG_FILE" 2>&1
+    # shellcheck disable=SC2181
+    if [ $? -ne 0 ]; then
+        log_error "Install pikvmd-backend.tar.gz fail"
+        cd ../ && rm -rf pikvm-backend
+        exit 1
+    fi
+
+    # 备份sqlite.db、override.yaml 99-kvmd.rules
+    mkdir -p ./back
+    # cp -r /etc/kvmd/{sqlite.db,override.yaml} ./back
+    cp -r /etc/udev/rules.d/99-kvmd.rules ./back
+
+    install -Dm755 -t /usr/bin scripts/kvmd-{bootconfig,gencert,certbot,local,udev-hdmiusb-check}
+    install -Dm755 -t /usr/local/bin/ systems/usr/local/bin/{gpio-check,node_exporter}
+
+    install -Dm644 -t /usr/lib/systemd/system configs/os/services/*
+    install -DTm644 configs/os/sysusers.conf /usr/lib/sysusers.d/kvmd.conf
+    install -DTm644 configs/os/tmpfiles.conf /usr/lib/tmpfiles.d/kvmd.conf
+
+    mkdir -p /usr/share/kvmd
+    cp -r {hid,extras,contrib/keymaps} /usr/share/kvmd
+    find /usr/share/kvmd/web -name '*.pug' -exec rm -f '{}' \;
+
+    #local _cfg_default=usr/share/kvmd/configs.default
+    mkdir -p usr/share/kvmd/configs.default
+    cp -r configs/* usr/share/kvmd/configs.default
+
+    find -name ".gitignore" -delete
+    find usr/share/kvmd/configs.default -type f -exec chmod 444 '{}' \;
+    chmod 400 usr/share/kvmd/configs.default/kvmd/*passwd
+    chmod 400 usr/share/kvmd/configs.default/kvmd/*.secret
+    chmod 750 usr/share/kvmd/configs.default/os/sudoers
+    chmod 400 usr/share/kvmd/configs.default/os/sudoers/*
+
+    mkdir -p /etc/kvmd/{nginx,vnc}/ssl
+    chmod 755 /etc/kvmd/{nginx,vnc}/ssl
+    install -Dm444 -t /etc/kvmd/nginx usr/share/kvmd/configs.default/nginx/*.conf
+
+    # 恢复已有的 nginx 配置，缓存配置文件：/app/nginx
+    if [ ! -e ${NGINX_INIT_PATH} ]; then
+        log_warning "nginx init file not exists"
+    else
+        http_type=$(awk NR==1 ${NGINX_INIT_PATH})
+        http_port=$(awk NR==2 ${NGINX_INIT_PATH})
+        https_port=$(awk NR==3 ${NGINX_INIT_PATH})
+        if [ "${http_type}" == "https" ];then
+            echo "http_type is https"
+            if [ ! -e /etc/kvmd/nginx/nginx-https.conf ]; then
+                log_warning "nginx-https file not exists"
+            else
+                cp /etc/kvmd/nginx/nginx-https.conf /etc/kvmd/nginx/nginx.conf
+            fi
+            sed -i "s/listen 443/listen ${https_port}/g" /etc/kvmd/nginx/listen-https.conf
+            sed -i "s/listen \[::\]:443/listen \[::\]:${https_port}/g" /etc/kvmd/nginx/listen-https.conf
+        else
+            echo "http_type is http"
+            if [ ! -e /etc/kvmd/nginx/nginx-http.conf ]; then
+                log_warning "nginx-https file not exists"
+            else
+                cp /etc/kvmd/nginx/nginx-http.conf /etc/kvmd/nginx/nginx.conf
+            fi
+            sed -i "s/listen 80/listen ${http_port}/g" /etc/kvmd/nginx/listen-http.conf
+            sed -i "s/listen \[::\]:80/listen \[::\]:${http_port}/g" /etc/kvmd/nginx/listen-http.conf
+        fi
+    fi
+
+    chmod 644 /etc/kvmd/nginx/{nginx,redirect-to-https,ssl,listen-http{,s}}.conf
+
+    mkdir -p /etc/kvmd/janus
+    chmod 755 /etc/kvmd/janus
+    install -Dm444 -t /etc/kvmd/janus usr/share/kvmd/configs.default/janus/*.jcfg
+
+    install -Dm644 -t /etc/kvmd usr/share/kvmd/configs.default/kvmd/*.yaml
+    install -Dm600 -t /etc/kvmd usr/share/kvmd/configs.default/kvmd/*passwd
+    install -Dm600 -t /etc/kvmd usr/share/kvmd/configs.default/kvmd/*.secret
+    install -Dm644 -t /etc/kvmd usr/share/kvmd/configs.default/kvmd/web.css
+    mkdir -p /etc/kvmd/override.d
+
+    mkdir -p /var/lib/kvmd/{msd,pst}
+
+    # Avoid dhcp problems
+    # install -DTm755 configs/os/netctl-dhcp "$pkgdir/etc/netctl/hooks/pikvm-dhcp"
+
+    install -DTm644 configs/os/sysctl.conf /etc/sysctl.d/99-kvmd.conf
+    # install -DTm644 configs/os/udev/v0-mine-99-kvmd.rules /etc/udev/rules.d/99-kvmd.rules
+    install -DTm444 configs/kvmd/main/v2-hdmi-rpi4.yaml /etc/kvmd/main.yaml
+
+    # 恢复sqlite.db、override.yaml 99-kvmd.rules
+    # cp -r ./back/{sqlite.db,override.yaml} /etc/kvmd/
+    # shellcheck disable=SC1083
+    cp -r ./back/{sqlite.db} /etc/kvmd/
+    cp -r ./back/99-kvmd.rules /etc/udev/rules.d/
+
+    # 处理override.yml的配置
+    width=$(v4l2-ctl -d /dev/v4l-subdev2 --query-dv-timings| awk 'NR==1{print $3}')
+    height=$(v4l2-ctl -d /dev/v4l-subdev2 --query-dv-timings| awk 'NR==2{print $3}')
+    if [ "$width" != "Numerical" ]; then
+        sed -i "s/--resolution=1920x1080/--resolution=${width}x${height}/g" /etc/kvmd/override.yaml
+        sed -i "s/--width=1920/--width=${width}/g" /etc/kvmd/override.yaml
+        sed -i "s/--height=1080/--height=${height}/g" /etc/kvmd/override.yaml
+    fi
+
+    cd ../ && rm -rf pikvm-backend
+    log_info "Install pikvmd-backend.tar.gz success"
+fi
+
+
+log_info "==> Ensuring KVMD users and groups ..."
+
+systemd-sysusers /usr/lib/sysusers.d/kvmd.conf
+
+# https://github.com/systemd/systemd/issues/13522
+# shellcheck disable=SC2013
+for user in $(grep '^u ' /usr/lib/sysusers.d/kvmd.conf | awk '{print $2}'); do
+	usermod --expiredate= "$user" >/dev/null
+done
+
+chown kvmd:kvmd /etc/kvmd/htpasswd || true
+chown kvmd:kvmd /etc/kvmd/totp.secret || true
+chown kvmd-ipmi:kvmd-ipmi /etc/kvmd/ipmipasswd || true
+chown kvmd-vnc:kvmd-vnc /etc/kvmd/vncpasswd || true
+chmod 600 /etc/kvmd/*passwd || true
+for target in nginx redirect-to-https ssl listen-http listen-https; do
+	chmod 644 "/etc/kvmd/nginx/$target.conf" || true
+done
+
+chown kvmd /var/lib/kvmd/msd 2>/dev/null || true
+chown kvmd-pst /var/lib/kvmd/pst 2>/dev/null || true
+
+if [ ! -e /etc/kvmd/nginx/ssl/server.crt ]; then
+	echo "==> Generating KVMD-Nginx certificate ..."
+	kvmd-gencert --do-the-thing
+fi
+
+if [ ! -e /etc/kvmd/vnc/ssl/server.crt ]; then
+	echo "==> Generating KVMD-VNC certificate ..."
+	kvmd-gencert --do-the-thing --vnc
+fi
+
+for target in nginx vnc; do
+	chown root:root /etc/kvmd/$target/ssl || true
+	owner="root:kvmd-$target"
+	path="/etc/kvmd/$target/ssl/server.key"
+	if [ ! -L "$path" ]; then
+		chown "$owner" "$path" || true
+		chmod 440 "$path" || true
+	fi
+	path="/etc/kvmd/$target/ssl/server.crt"
+	if [ ! -L "$path" ]; then
+		chown "$owner" "$path" || true
+		chmod 444 "$path" || true
+	fi
+done
+
+log_info "==> Patching configs ..."
+#[ ! -f /etc/pacman.conf ] || sed -i -e "s|^Server = https://pikvm.org/repos/|Server = https://files.pikvm.org/repos/arch/|g" /etc/pacman.conf
+#[ ! -f /boot/config.txt ] || sed -i -e 's/^dtoverlay=pi3-disable-bt$/dtoverlay=disable-bt/g' /boot/config.txt
+#[ ! -f /boot/config.txt ] || sed -i -e 's/^dtoverlay=dwc2$/dtoverlay=dwc2,dr_mode=peripheral/g' /boot/config.txt
+#[ ! -f /etc/conf.d/rngd ] || (echo 'RNGD_OPTS="-o /dev/random -r /dev/hwrng -x jitter -x pkcs11 -x rtlsdr"' > /etc/conf.d/rngd)
+#[ ! -f /etc/pam.d/system-login ] || sed -i -e '/\<pam_systemd\.so\>/ s/^#*/#/' /etc/pam.d/system-login
+#[ ! -f /etc/pam.d/system-auth ] || sed -i -e '/\<pam_systemd_home\.so\>/ s/^#*/#/' /etc/pam.d/system-auth
+
+# Some update deletes /etc/motd, WTF
+# shellcheck disable=SC2015,SC2166
+#[ ! -f /etc/motd -a -f /etc/motd.pacsave ] && mv /etc/motd.pacsave /etc/motd || true
+# 设置ttyS3、ttyS4的波特率
+stty -F /dev/ttyS3 9600
+stty -F /dev/ttyS4 9600
+# 修改hostname
+hostnamectl set-hostname datrix-kvm

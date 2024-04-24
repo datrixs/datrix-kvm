@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+export PACK_NAME=RCC-KVMD
+export VERSION=2.6.0
+# shellcheck disable=SC2155
+export CUR_DATE=$(date +%Y%m%d%H%M%S)
+# shellcheck disable=SC2155
+export BUILDROOT=$(pwd)
+export BUILDPATH=${BUILDROOT}/build
+export FTP_SERVER="ftp://ip/upload/packages"
+export FTP_USER="datrix02"
+export FTP_PASSWD="Datrixinfo123"
+export PACKPATH=${BUILDROOT}/packages
+export KVMD_USTREAMER_BRANCH="dev"
+export KVMD_FRONT_BRANCH="ht"
+export BASE_APPS=false

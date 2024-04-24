@@ -1,0 +1,13 @@
+[Unit]
+Description=Auto Upgrade KVM by USB
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=3
+ExecStart=/usr/local/bin/AutoUpgrade
+
+[Install]
+WantedBy=multi-user.target

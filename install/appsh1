@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Author: wu.changwen
+# PKGINSTALL、deb第三方包、Python第三方包等
+
+PACK_PATH="/home/tmp/pack"
+APP1_PACK="/home/tmp/pack/apps1"
+LOG_FILE="/var/log/upgrade.log"
+
+source /usr/sbin/logger.sh ${LOG_FILE}
+
+cd ${PACK_PATH}
+if [ ! -e ${APP1_PACK} ]; then
+    log_warning "app1 pack not exist, not need to upgrade it"
+    exit 1
+fi    
+
+tar -zxvf ${APP1_PACK} -C ./ >> "$LOG_FILE" 2>&1
+if [ $? -ne 0 ]; then
+    log_error "tar zxvf ${APP1_PACK} fail"
+    exit 1
+fi
+
+# Install PKGINSTALL
+base_pack=${PACK_PATH}/base-packages.tar.gz
+if [ ! -e ${base_pack} ]; then
+    log_warning "base-packages.tar.gz not exist, not to upgrade it"
+else
+    tar -zxvf ${base_pack} -C / >> "$LOG_FILE" 2>&1
+    if [ $? -ne 0 ]; then
+        log_error "Install ${base_pack} fail"
+        rm -rf ${base_pack}
+        exit 1
+    fi
+    log_info "Upgrade ${base_pack} success"
+    rm -rf ${base_pack}
+fi
+
+# Install deb第三方包
+deb_pack=${PACK_PATH}/debian-packageas.tar.gz
+if [ ! -e ${deb_pack} ]; then
+    log_warning "debian-packages.tar.gz not exist, not to upgrade it"
+else
+    mkdir -p ./deb
+    tar -zxvf ${deb_pack} -C ./deb && dpkg -i ./deb/*.deb >> "$LOG_FILE" 2>&1
+    if [ $? -ne 0 ]; then
+        log_error "Install debian-packages.tar.gz fail"
+        rm -rf ./deb && rm -rf debian-packages.tar.gz
+        exit 1
+    fi
+    log_info "Upgrade ${deb_pack} success"
+    rm -rf ./deb && rm -rf debian-packages.tar.gz
+fi
+
+# Install python第三方包
+py_pack=${PACK_PATH}/python-packages.tar.gz
+if [ ! -e ${py_pack} ]; then
+    log_warning "python-packages.tar.gz not exist, not to upgrade it"
+else
+    mkdir -p ./python
+    tar -zxvf ${py_pack} -C ./python && cd ./python >> "$LOG_FILE" 2>&1
+    pip3 install --no-index --find-links=./ -r requirements.txt >> "$LOG_FILE" 2>&1
+    if [ $? -ne 0 ]; then
+        log_error "Install python-packages.tar.gz fail"
+        cd ../ && rm -rf ./python && rm -rf ${py_pack}
+        exit 1
+    fi
+    log_info "Upgrade ${deb_pack} success"
+    cd ../ && rm -rf ./python && rm -rf ${py_pack}
+fi

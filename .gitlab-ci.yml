@@ -1,0 +1,33 @@
+stages:
+  - codescan
+  - build
+
+codescan:
+  stage: codescan
+  image: sonarsource/sonar-scanner-cli:4.8.0
+  script:
+    - echo $SONAR_HOST_URL
+    - sonar-scanner -Dsonar.projectKey=Datrix-RCC-PIKVMD-BACNEND -Dsonar.host.url=http://ip:port -Dsonar.login=sqp_4a09df4c8f12d60790d5455d296c1928a297a6df -Dsonar.sources=.
+  allow_failure: true
+  when: always
+  tags:
+    - Datrix-RCC-PIKVMD-BACNEND
+
+build:
+  stage: build
+  needs:
+    - codescan
+  image: datrixinfo.com/kvm/build:v2.2.0
+  before_script:
+    - source ENVRIONMENT
+    - export PACKNAME=${PACK_NAME}-${VERSION}-${CI_COMMIT_BRANCH}-${CUR_DATE}.tar.gz
+    - export FTPSERVERPATH=${FTP_SERVER}/${PACKNAME}
+    - apt-get update && apt-get install -y aptitude curl wget git make cmake checkinstall dh-make zip
+  script:
+    - echo "开始打包..."
+    - bash PGKBUILD.sh
+    - curl --user ${FTP_USER}:${FTP_PASSWD} -T ${PACKNAME} ${FTPSERVERPATH}
+    - echo "打包并上传成功，${FTPSERVERPATH}"
+  when: always
+  tags:
+    - Datrix-RCC-PIKVMD-INSTALL

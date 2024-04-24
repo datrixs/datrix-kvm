@@ -1,0 +1,13 @@
+[Unit]
+Description=PiKVM - KVMD localer keyboard & mouse
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=3
+
+ExecStart=/usr/local/bin/kvmd-localer --uri=http://127.0.0.1/api/rpc
+TimeoutStopSec=3
+
+[Install]
+WantedBy=multi-user.target

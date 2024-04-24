@@ -1,0 +1,94 @@
+#!/bin/bash
+# ========================================================================== #
+#                                                                            #
+#    KVMD - The main PiKVM daemon.                                           #
+#                                                                            #
+#    Copyright (C) 2018-2022  Maxim Devaev <mdevaev@gmail.com>               #
+#                                                                            #
+#    This program is free software: you can redistribute it and/or modify    #
+#    it under the terms of the GNU General Public License as published by    #
+#    the Free Software Foundation, either version 3 of the License, or       #
+#    (at your option) any later version.                                     #
+#                                                                            #
+#    This program is distributed in the hope that it will be useful,         #
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of          #
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the           #
+#    GNU General Public License for more details.                            #
+#                                                                            #
+#    You should have received a copy of the GNU General Public License       #
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.  #
+#                                                                            #
+# ========================================================================== #
+
+
+shell_command=/usr/local/bin/kvmd-localer
+
+function start() {
+    # shellcheck disable=SC2006
+    # shellcheck disable=SC2009
+    pid=`ps -ef | grep $shell_command |grep -v grep | awk '{print $2}'`
+    # shellcheck disable=SC2086
+    if [ $pid ];then
+        echo "kvmd-localer is running, PID: $pid"
+        return
+    fi
+
+    if [ -f $shell_command ];then
+        nohup $shell_command >> /var/log/kvmd/backend/kvmd-localer.log 2>&1 &
+        # shellcheck disable=SC2181
+        [ $? -eq 0 ] && echo "start kvmd-loacler finished."
+        echo "log output file: /var/log/kvmd/backend/kvmd-localer.log"
+    else
+        echo "Please check, the command $shell_command is not exists"
+    fi
+}
+
+
+function stop() {
+    # shellcheck disable=SC2006
+    # shellcheck disable=SC2009
+    pid=`ps -ef | grep $shell_command |grep -v grep | awk '{print $2}'`
+    if [ "$pid" ];then
+        # shellcheck disable=SC2009
+        ps -ef | grep $shell_command | grep -v grep | awk '{print $2}' | xargs kill -9
+        # shellcheck disable=SC2181
+        [ $? -eq 0 ] && echo "stop kvmd-localer finished"
+    else
+        echo "kvmd-localer is not running"
+    fi
+}
+
+function status() {
+    # shellcheck disable=SC2006
+    # shellcheck disable=SC2009
+    pid=`ps -ef | grep $shell_command |grep -v grep | awk '{print $2}'`
+	if [ "$pid" ];then
+		echo "kvmd-localer is running, PID: $pid"
+	else
+		echo "kvmd-localer is stopped"
+	fi
+}
+
+function usage() {
+    echo "Usage: $shell_command {start|stop|status|restart}"
+}
+
+
+case $1 in
+start)
+    start
+    ;;
+stop)
+    stop
+    ;;
+status)
+    status
+    ;;
+restart)
+    stop
+    start
+    ;;
+*)
+    usage
+    exit 1
+esac
